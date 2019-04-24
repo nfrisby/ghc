@@ -173,7 +173,7 @@ validate-x86_64-linux-deb8-hadrian:
 hadrian-ghc-in-ghci:
   <<: *only-default
   stage: build
-  image: ghcci/x86_64-linux-deb8:0.1
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
   before_script:
     # workaround for docker permissions
     - sudo chown ghc:ghc -R .
@@ -711,7 +711,7 @@ doc-tarball:
   stage: packaging
   tags:
     - x86_64-linux
-  image: ghcci/x86_64-linux-deb9:0.2
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
   dependencies:
     - validate-x86_64-linux-deb9
     - validate-x86_64-windows
@@ -746,7 +746,7 @@ source-tarball:
   stage: packaging
   tags:
     - x86_64-linux
-  image: ghcci/x86_64-linux-deb9:0.2
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
   dependencies: []
   only:
     - tags
@@ -776,7 +776,7 @@ source-tarball:
 .hackage:
   <<: *only-default
   stage: hackage
-  image: ghcci/x86_64-linux-deb9:0.2
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
   tags:
     - x86_64-linux
   dependencies: []
@@ -805,7 +805,7 @@ pages:
   stage: deploy
   dependencies:
     - doc-tarball
-  image: ghcci/x86_64-linux-deb9:0.2
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb9:$DOCKER_REV"
   # Due to Windows allow_failure
   allow_failure: true
   tags:
