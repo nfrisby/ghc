@@ -266,15 +266,9 @@ flushEventLog(void)
 }
 
 static void
-postHeaderEvents(void)
+init_event_types(void)
 {
-    // Write in buffer: the header begin marker.
-    postInt32(&eventBuf, EVENT_HEADER_BEGIN);
-
-    // Mark beginning of event types in the header.
-    postInt32(&eventBuf, EVENT_HET_BEGIN);
     for (int t = 0; t < NUM_GHC_EVENT_TAGS; ++t) {
-
         eventTypes[t].etNum = t;
         eventTypes[t].desc = EventDesc[t];
 
@@ -445,7 +439,19 @@ postHeaderEvents(void)
         default:
             continue; /* ignore deprecated events */
         }
+    }
+}
 
+static void
+postHeaderEvents(void)
+{
+    // Write in buffer: the header begin marker.
+    postInt32(&eventBuf, EVENT_HEADER_BEGIN);
+
+    // Mark beginning of event types in the header.
+    postInt32(&eventBuf, EVENT_HET_BEGIN);
+
+    for (int t = 0; t < NUM_GHC_EVENT_TAGS; ++t) {
         // Write in buffer: the start event type.
         postEventType(&eventBuf, &eventTypes[t]);
     }
@@ -464,6 +470,8 @@ void
 initEventLogging(const EventLogWriter *ev_writer)
 {
     uint32_t n_caps;
+
+    init_event_types();
 
     event_log_writer = ev_writer;
     initEventLogWriter();
