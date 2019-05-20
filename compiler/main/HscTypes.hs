@@ -30,6 +30,7 @@ module HscTypes (
         ModGuts(..), CgGuts(..), ForeignStubs(..), appendStubC,
         ImportedMods, ImportedBy(..), importedByUser, ImportedModsVal(..), SptEntry(..),
         ForeignSrcLang(..),
+        phaseForeignLanguage,
 
         ModSummary(..), ms_imps, ms_installed_mod, ms_mod_name, showModMsg, isBootSummary,
         msHsFilePath, msHiFilePath, msObjFilePath,
@@ -182,6 +183,7 @@ import CmdLineParser
 import DynFlags
 import DriverPhases     ( Phase, HscSource(..), hscSourceString
                         , isHsBootOrSig, isHsigFile )
+import qualified DriverPhases as Phase
 import BasicTypes
 import IfaceSyn
 import Maybes
@@ -2803,6 +2805,9 @@ msHsFilePath  ms = expectJust "msHsFilePath" (ml_hs_file  (ms_location ms))
 msHiFilePath  ms = ml_hi_file  (ms_location ms)
 msObjFilePath ms = ml_obj_file (ms_location ms)
 
+msDynObjFilePath :: ModSummary -> DynFlags -> FilePath
+msDynObjFilePath ms dflags = dynamicOutputFile dflags (msObjFilePath ms)
+
 -- | Did this 'ModSummary' originate from a hs-boot file?
 isBootSummary :: ModSummary -> Bool
 isBootSummary ms = ms_hsc_src ms == HsBootFile
@@ -2822,20 +2827,26 @@ showModMsg :: DynFlags -> HscTarget -> Bool -> ModSummary -> String
 showModMsg dflags target recomp mod_summary = showSDoc dflags $
    if gopt Opt_HideSourcePaths dflags
       then text mod_str
-      else hsep
+      else hsep $
          [ text (mod_str ++ replicate (max 0 (16 - length mod_str)) ' ')
          , char '('
          , text (op $ msHsFilePath mod_summary) <> char ','
-         , case target of
-              HscInterpreted | recomp -> text "interpreted"
-              HscNothing              -> text "nothing"
-              _                       -> text (op $ msObjFilePath mod_summary)
-         , char ')'
-         ]
+         ] ++
+         if gopt Opt_BuildDynamicToo dflags
+            then [ text obj_file <> char ','
+                 , text dyn_file
+                 , char ')'
+                 ]
+            else [ text obj_file, char ')' ]
   where
-    op      = normalise
-    mod     = moduleName (ms_mod mod_summary)
-    mod_str = showPpr dflags mod ++ hscSourceString (ms_hsc_src mod_summary)
+    op       = normalise
+    mod      = moduleName (ms_mod mod_summary)
+    mod_str  = showPpr dflags mod ++ hscSourceString (ms_hsc_src mod_summary)
+    dyn_file = op $ msDynObjFilePath mod_summary dflags
+    obj_file = case target of
+                HscInterpreted | recomp -> "interpreted"
+                HscNothing              -> "nothing"
+                _                       -> (op $ msObjFilePath mod_summary)
 
 {-
 ************************************************************************
@@ -3136,3 +3147,15 @@ Also see Note [Typechecking Complete Matches] in TcBinds for a more detailed
 explanation for how GHC ensures that all the conlikes in a COMPLETE set are
 consistent.
 -}
+
+-- | Foreign language of the phase if the phase deals with a foreign code
+phaseForeignLanguage :: Phase -> Maybe ForeignSrcLang
+phaseForeignLanguage phase = case phase of
+  Phase.Cc           -> Just LangC
+  Phase.Ccxx         -> Just LangCxx
+  Phase.Cobjc        -> Just LangObjc
+  Phase.Cobjcxx      -> Just LangObjcxx
+  Phase.HCc          -> Just LangC
+  Phase.As _         -> Just LangAsm
+  Phase.MergeForeign -> Just RawObject
+  _                  -> Nothing

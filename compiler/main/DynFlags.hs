@@ -41,6 +41,7 @@ module DynFlags (
         whenGeneratingDynamicToo, ifGeneratingDynamicToo,
         whenCannotGenerateDynamicToo,
         dynamicTooMkDynamicDynFlags,
+        dynamicOutputFile,
         DynFlags(..),
         FlagSpec(..),
         HasDynFlags(..), ContainsDynFlags(..),
@@ -58,7 +59,7 @@ module DynFlags (
         fFlags, fLangFlags, xFlags,
         wWarningFlags,
         dynFlagDependencies,
-        tablesNextToCode, mkTablesNextToCode,
+        tablesNextToCode,
         makeDynFlagsConsistent,
         shouldUseColor,
         shouldUseHexWordLiterals,
@@ -86,13 +87,15 @@ module DynFlags (
 
         -- ** System tool settings and locations
         Settings(..),
+        IntegerLibrary(..),
         targetPlatform, programName, projectVersion,
         ghcUsagePath, ghciUsagePath, topDir, tmpDir, rawSettings,
         versionedAppDir,
         extraGccViaCFlags, systemPackageConfig,
         pgm_L, pgm_P, pgm_F, pgm_c, pgm_a, pgm_l, pgm_dll, pgm_T,
         pgm_windres, pgm_libtool, pgm_ar, pgm_ranlib, pgm_lo, pgm_lc,
-        pgm_lcc, pgm_i, opt_L, opt_P, opt_F, opt_c, opt_a, opt_l, opt_i,
+        pgm_lcc, pgm_i,
+        opt_L, opt_P, opt_F, opt_c, opt_cxx, opt_a, opt_l, opt_i,
         opt_P_signature,
         opt_windres, opt_lo, opt_lc, opt_lcc,
 
@@ -146,6 +149,7 @@ module DynFlags (
 #include "GHCConstantsHaskellExports.hs"
         bLOCK_SIZE_W,
         wORD_SIZE_IN_BITS,
+        wordAlignment,
         tAG_MASK,
         mAX_PTR_TAG,
         tARGET_MIN_INT, tARGET_MAX_INT, tARGET_MAX_WORD,
@@ -204,7 +208,7 @@ import Maybes
 import MonadUtils
 import qualified Pretty
 import SrcLoc
-import BasicTypes       ( IntWithInf, treatZeroAsInf )
+import BasicTypes       ( Alignment, alignmentOf, IntWithInf, treatZeroAsInf )
 import FastString
 import Fingerprint
 import Outputable
@@ -382,6 +386,7 @@ data DumpFlag
    | Opt_D_dump_spec
    | Opt_D_dump_prep
    | Opt_D_dump_stg
+   | Opt_D_dump_stg_final
    | Opt_D_dump_call_arity
    | Opt_D_dump_exitify
    | Opt_D_dump_stranal
@@ -839,6 +844,7 @@ data WarningFlag =
    | Opt_WarnImplicitKindVars             -- Since 8.6
    | Opt_WarnSpaceAfterBang
    | Opt_WarnMissingDerivingStrategies    -- Since 8.8
+   | Opt_WarnPrepositiveQualifiedModule   -- Since TBD
    deriving (Eq, Show, Enum)
 
 data Language = Haskell98 | Haskell2010
@@ -1297,6 +1303,11 @@ type LlvmTargets = [(String, LlvmTarget)]
 type LlvmPasses = [(Int, String)]
 type LlvmConfig = (LlvmTargets, LlvmPasses)
 
+data IntegerLibrary
+    = IntegerGMP
+    | IntegerSimple
+    deriving (Read, Show, Eq)
+
 data Settings = Settings {
   sTargetPlatform        :: Platform,       -- Filled in by SysTools
   sGhcUsagePath          :: FilePath,       -- ditto
@@ -1340,6 +1351,7 @@ data Settings = Settings {
                                          -- See Note [Repeated -optP hashing]
   sOpt_F                 :: [String],
   sOpt_c                 :: [String],
+  sOpt_cxx               :: [String],
   sOpt_a                 :: [String],
   sOpt_l                 :: [String],
   sOpt_windres           :: [String],
@@ -1348,7 +1360,22 @@ data Settings = Settings {
   sOpt_lcc               :: [String], -- LLVM: c compiler
   sOpt_i                 :: [String], -- iserv options
 
-  sPlatformConstants     :: PlatformConstants
+  sPlatformConstants     :: PlatformConstants,
+
+  -- Formerly Config.hs, target specific
+  sTargetPlatformString :: String, -- TODO Recalculate string from richer info?
+  sIntegerLibrary        :: String,
+  sIntegerLibraryType    :: IntegerLibrary,
+  sGhcWithInterpreter    :: Bool,
+  sGhcWithNativeCodeGen  :: Bool,
+  sGhcWithSMP            :: Bool,
+  sGhcRTSWays            :: String,
+  sTablesNextToCode      :: Bool,
+  sLeadingUnderscore     :: Bool,
+  sLibFFI                :: Bool,
+  sGhcThreaded           :: Bool,
+  sGhcDebugged           :: Bool,
+  sGhcRtsWithLibdw       :: Bool
  }
 
 targetPlatform :: DynFlags -> Platform
@@ -1423,6 +1450,8 @@ opt_F dflags = sOpt_F (settings dflags)
 opt_c                 :: DynFlags -> [String]
 opt_c dflags = concatMap (wayOptc (targetPlatform dflags)) (ways dflags)
             ++ sOpt_c (settings dflags)
+opt_cxx               :: DynFlags -> [String]
+opt_cxx dflags = sOpt_cxx (settings dflags)
 opt_a                 :: DynFlags -> [String]
 opt_a dflags = sOpt_a (settings dflags)
 opt_l                 :: DynFlags -> [String]
@@ -1603,28 +1632,27 @@ instance Outputable PackageFlag where
     ppr (ExposePackage n arg rn) = text n <> braces (ppr arg <+> ppr rn)
     ppr (HidePackage str) = text "-hide-package" <+> text str
 
-defaultHscTarget :: Platform -> HscTarget
+defaultHscTarget :: Settings -> HscTarget
 defaultHscTarget = defaultObjectTarget
 
 -- | The 'HscTarget' value corresponding to the default way to create
 -- object files on the current platform.
-defaultObjectTarget :: Platform -> HscTarget
-defaultObjectTarget platform
+defaultObjectTarget :: Settings -> HscTarget
+defaultObjectTarget settings
   | platformUnregisterised platform     =  HscC
-  | cGhcWithNativeCodeGen == "YES"      =  HscAsm
+  | sGhcWithNativeCodeGen settings      =  HscAsm
   | otherwise                           =  HscLlvm
-
-tablesNextToCode :: DynFlags -> Bool
-tablesNextToCode dflags
-    = mkTablesNextToCode (platformUnregisterised (targetPlatform dflags))
+  where
+    platform = sTargetPlatform settings
 
 -- Determines whether we will be compiling
 -- info tables that reside just before the entry code, or with an
 -- indirection to the entry code.  See TABLES_NEXT_TO_CODE in
 -- includes/rts/storage/InfoTables.h.
-mkTablesNextToCode :: Bool -> Bool
-mkTablesNextToCode unregisterised
-    = not unregisterised && cGhcEnableTablesNextToCode == "YES"
+tablesNextToCode :: DynFlags -> Bool
+tablesNextToCode dflags =
+    not (platformUnregisterised $ targetPlatform dflags) &&
+    sTablesNextToCode (settings dflags)
 
 data DynLibLoader
   = Deployable
@@ -1817,6 +1845,12 @@ dynamicTooMkDynamicDynFlags dflags0
           dflags4 = gopt_unset dflags3 Opt_BuildDynamicToo
       in dflags4
 
+-- | Compute the path of the dynamic object corresponding to an object file.
+dynamicOutputFile :: DynFlags -> FilePath -> FilePath
+dynamicOutputFile dflags outputFile = dynOut outputFile
+  where
+    dynOut = flip addExtension (dynObjectSuf dflags) . dropExtension
+
 -----------------------------------------------------------------------------
 
 -- | Used by 'GHC.runGhc' to partially initialize a new 'DynFlags' value
@@ -1872,8 +1906,8 @@ defaultDynFlags mySettings (myLlvmTargets, myLlvmPasses) =
      DynFlags {
         ghcMode                 = CompManager,
         ghcLink                 = LinkBinary,
-        hscTarget               = defaultHscTarget (sTargetPlatform mySettings),
-        integerLibrary          = cIntegerLibraryType,
+        hscTarget               = defaultHscTarget mySettings,
+        integerLibrary          = sIntegerLibraryType mySettings,
         verbosity               = 0,
         optLevel                = 0,
         debugLevel              = 0,
@@ -2245,6 +2279,7 @@ languageExtensions (Just Haskell98)
     = [LangExt.ImplicitPrelude,
        -- See Note [When is StarIsType enabled]
        LangExt.StarIsType,
+       LangExt.CUSKs,
        LangExt.MonomorphismRestriction,
        LangExt.NPlusKPatterns,
        LangExt.DatatypeContexts,
@@ -2261,6 +2296,7 @@ languageExtensions (Just Haskell2010)
     = [LangExt.ImplicitPrelude,
        -- See Note [When is StarIsType enabled]
        LangExt.StarIsType,
+       LangExt.CUSKs,
        LangExt.MonomorphismRestriction,
        LangExt.DatatypeContexts,
        LangExt.TraditionalRecordSyntax,
@@ -2520,7 +2556,7 @@ setObjectDir, setHiDir, setHieDir, setStubDir, setDumpDir, setOutputDir,
          setDynObjectSuf, setDynHiSuf,
          setDylibInstallName,
          setObjectSuf, setHiSuf, setHieSuf, setHcSuf, parseDynLibLoaderMode,
-         setPgmP, addOptl, addOptc, addOptP,
+         setPgmP, addOptl, addOptc, addOptcxx, addOptP,
          addCmdlineFramework, addHaddockOpts, addGhciScript,
          setInteractivePrint
    :: String -> DynFlags -> DynFlags
@@ -2636,6 +2672,7 @@ setDumpPrefixForce f d = d { dumpPrefixForce = f}
 setPgmP   f = let (pgm:args) = words f in alterSettings (\s -> s { sPgm_P   = (pgm, map Option args)})
 addOptl   f = alterSettings (\s -> s { sOpt_l   = f : sOpt_l s})
 addOptc   f = alterSettings (\s -> s { sOpt_c   = f : sOpt_c s})
+addOptcxx f = alterSettings (\s -> s { sOpt_cxx = f : sOpt_cxx s})
 addOptP   f = alterSettings (\s -> s { sOpt_P   = f : sOpt_P s
                                      , sOpt_P_fingerprint = fingerprintStrings (f : sOpt_P s)
                                      })
@@ -2765,11 +2802,11 @@ parseDynamicFlagsFull activeFlags cmdline dflags0 args = do
   let chooseOutput
         | isJust (outputFile dflags3)          -- Only iff user specified -o ...
         , not (isJust (dynOutputFile dflags3)) -- but not -dyno
-        = return $ dflags3 { dynOutputFile = Just $ dynOut (fromJust $ outputFile dflags3) }
+        = return $ dflags3 { dynOutputFile = Just $ dynamicOutputFile dflags3 outFile }
         | otherwise
         = return dflags3
         where
-          dynOut = flip addExtension (dynObjectSuf dflags3) . dropExtension
+          outFile = fromJust $ outputFile dflags3
   dflags4 <- ifGeneratingDynamicToo dflags3 chooseOutput (return dflags3)
 
   let (dflags5, consistency_warnings) = makeDynFlagsConsistent dflags4
@@ -3038,6 +3075,8 @@ dynamic_flags_deps = [
       (hasArg (\f -> alterSettings (\s -> s { sOpt_F   = f : sOpt_F s})))
   , make_ord_flag defFlag "optc"
       (hasArg addOptc)
+  , make_ord_flag defFlag "optcxx"
+      (hasArg addOptcxx)
   , make_ord_flag defFlag "opta"
       (hasArg (\f -> alterSettings (\s -> s { sOpt_a   = f : sOpt_a s})))
   , make_ord_flag defFlag "optl"
@@ -3331,6 +3370,8 @@ dynamic_flags_deps = [
         (setDumpFlag Opt_D_dump_prep)
   , make_ord_flag defGhcFlag "ddump-stg"
         (setDumpFlag Opt_D_dump_stg)
+  , make_ord_flag defGhcFlag "ddump-stg-final"
+        (setDumpFlag Opt_D_dump_stg_final)
   , make_ord_flag defGhcFlag "ddump-call-arity"
         (setDumpFlag Opt_D_dump_call_arity)
   , make_ord_flag defGhcFlag "ddump-exitify"
@@ -3684,7 +3725,7 @@ dynamic_flags_deps = [
   , make_ord_flag defFlag "fno-code"         (NoArg ((upd $ \d ->
                   d { ghcLink=NoLink }) >> setTarget HscNothing))
   , make_ord_flag defFlag "fbyte-code"       (NoArg (setTarget HscInterpreted))
-  , make_ord_flag defFlag "fobject-code"     (NoArg (setTargetWithPlatform
+  , make_ord_flag defFlag "fobject-code"     (NoArg (setTargetWithSettings
                                                              defaultHscTarget))
   , make_dep_flag defFlag "fglasgow-exts"
       (NoArg enableGlasgowExts) "Use individual extensions instead"
@@ -4052,7 +4093,10 @@ wWarningFlagsDeps = [
   flagSpec "star-binder"                 Opt_WarnStarBinder,
   flagSpec "star-is-type"                Opt_WarnStarIsType,
   flagSpec "missing-space-after-bang"    Opt_WarnSpaceAfterBang,
-  flagSpec "partial-fields"              Opt_WarnPartialFields ]
+  flagSpec "partial-fields"              Opt_WarnPartialFields,
+  flagSpec "prepositive-qualified-module"
+                                         Opt_WarnPrepositiveQualifiedModule
+ ]
 
 -- | These @-\<blah\>@ flags can all be reversed with @-no-\<blah\>@
 negatableFlagsDeps :: [(Deprecation, FlagSpec GeneralFlag)]
@@ -4335,6 +4379,7 @@ xFlagsDeps = [
   flagSpec "BinaryLiterals"                   LangExt.BinaryLiterals,
   flagSpec "CApiFFI"                          LangExt.CApiFFI,
   flagSpec "CPP"                              LangExt.Cpp,
+  flagSpec "CUSKs"                            LangExt.CUSKs,
   flagSpec "ConstrainedClassMethods"          LangExt.ConstrainedClassMethods,
   flagSpec "ConstraintKinds"                  LangExt.ConstraintKinds,
   flagSpec "DataKinds"                        LangExt.DataKinds,
@@ -4378,6 +4423,7 @@ xFlagsDeps = [
                                               setGenDeriving,
   flagSpec "ImplicitParams"                   LangExt.ImplicitParams,
   flagSpec "ImplicitPrelude"                  LangExt.ImplicitPrelude,
+  flagSpec "ImportQualifiedPost"              LangExt.ImportQualifiedPost,
   flagSpec "ImpredicativeTypes"               LangExt.ImpredicativeTypes,
   flagSpec' "IncoherentInstances"             LangExt.IncoherentInstances
                                               setIncoherentInsts,
@@ -5362,12 +5408,12 @@ interpretPackageEnv dflags = do
 -- If we're linking a binary, then only targets that produce object
 -- code are allowed (requests for other target types are ignored).
 setTarget :: HscTarget -> DynP ()
-setTarget l = setTargetWithPlatform (const l)
+setTarget l = setTargetWithSettings (const l)
 
-setTargetWithPlatform :: (Platform -> HscTarget) -> DynP ()
-setTargetWithPlatform f = upd set
+setTargetWithSettings :: (Settings -> HscTarget) -> DynP ()
+setTargetWithSettings f = upd set
   where
-   set dfs = let l = f (targetPlatform dfs)
+   set dfs = let l = f (settings dfs)
              in if ghcLink dfs /= LinkBinary || isObjectTarget l
                 then dfs{ hscTarget = l }
                 else dfs
@@ -5598,14 +5644,14 @@ compilerInfo dflags
        ("Stage",                       cStage),
        ("Build platform",              cBuildPlatformString),
        ("Host platform",               cHostPlatformString),
-       ("Target platform",             cTargetPlatformString),
-       ("Have interpreter",            cGhcWithInterpreter),
+       ("Target platform",             sTargetPlatformString $ settings dflags),
+       ("Have interpreter",            showBool $ sGhcWithInterpreter $ settings dflags),
        ("Object splitting supported",  showBool False),
-       ("Have native code generator",  cGhcWithNativeCodeGen),
-       ("Support SMP",                 cGhcWithSMP),
-       ("Tables next to code",         cGhcEnableTablesNextToCode),
-       ("RTS ways",                    cGhcRTSWays),
-       ("RTS expects libdw",           showBool cGhcRtsWithLibdw),
+       ("Have native code generator",  showBool $ sGhcWithNativeCodeGen $ settings dflags),
+       ("Support SMP",                 showBool $ sGhcWithSMP $ settings dflags),
+       ("Tables next to code",         showBool $ sTablesNextToCode $ settings dflags),
+       ("RTS ways",                    sGhcRTSWays $ settings dflags),
+       ("RTS expects libdw",           showBool $ sGhcRtsWithLibdw $ settings dflags),
        -- Whether or not we support @-dynamic-too@
        ("Support dynamic-too",         showBool $ not isWindows),
        -- Whether or not we support the @-j@ flag with @--make@.
@@ -5632,7 +5678,7 @@ compilerInfo dflags
        ("GHC Dynamic",                 showBool dynamicGhc),
        -- Whether or not GHC was compiled using -prof
        ("GHC Profiled",                showBool rtsIsProfiled),
-       ("Leading underscore",          cLeadingUnderscore),
+       ("Leading underscore",          showBool $ sLeadingUnderscore $ settings dflags),
        ("Debug on",                    show debugIsOn),
        ("LibDir",                      topDir dflags),
        -- The path of the global package database used by GHC
@@ -5653,6 +5699,9 @@ bLOCK_SIZE_W dflags = bLOCK_SIZE dflags `quot` wORD_SIZE dflags
 
 wORD_SIZE_IN_BITS :: DynFlags -> Int
 wORD_SIZE_IN_BITS dflags = wORD_SIZE dflags * 8
+
+wordAlignment :: DynFlags -> Alignment
+wordAlignment dflags = alignmentOf (wORD_SIZE dflags)
 
 tAG_MASK :: DynFlags -> Int
 tAG_MASK dflags = (1 `shiftL` tAG_BITS dflags) - 1
@@ -5720,7 +5769,7 @@ makeDynFlagsConsistent dflags
       in loop dflags' warn
  | hscTarget dflags == HscC &&
    not (platformUnregisterised (targetPlatform dflags))
-    = if cGhcWithNativeCodeGen == "YES"
+    = if sGhcWithNativeCodeGen $ settings dflags
       then let dflags' = dflags { hscTarget = HscAsm }
                warn = "Compiler not unregisterised, so using native code generator rather than compiling via C"
            in loop dflags' warn
@@ -5736,7 +5785,7 @@ makeDynFlagsConsistent dflags
     = loop (dflags { hscTarget = HscC })
            "Compiler unregisterised, so compiling via C"
  | hscTarget dflags == HscAsm &&
-   cGhcWithNativeCodeGen /= "YES"
+   not (sGhcWithNativeCodeGen $ settings dflags)
       = let dflags' = dflags { hscTarget = HscLlvm }
             warn = "No native code generator, so using LLVM"
         in loop dflags' warn
@@ -5822,19 +5871,23 @@ data SseVersion = SSE1
 isSseEnabled :: DynFlags -> Bool
 isSseEnabled dflags = case platformArch (targetPlatform dflags) of
     ArchX86_64 -> True
-    ArchX86    -> sseVersion dflags >= Just SSE1
+    ArchX86    -> True
     _          -> False
 
 isSse2Enabled :: DynFlags -> Bool
 isSse2Enabled dflags = case platformArch (targetPlatform dflags) of
-    ArchX86_64 -> -- SSE2 is fixed on for x86_64.  It would be
-                  -- possible to make it optional, but we'd need to
-                  -- fix at least the foreign call code where the
-                  -- calling convention specifies the use of xmm regs,
-                  -- and possibly other places.
-                  True
-    ArchX86    -> sseVersion dflags >= Just SSE2
+  -- We Assume  SSE1 and SSE2 operations are available on both
+  -- x86 and x86_64. Historically we didn't default to SSE2 and
+  -- SSE1 on x86, which results in defacto nondeterminism for how
+  -- rounding behaves in the associated x87 floating point instructions
+  -- because variations in the spill/fpu stack placement of arguments for
+  -- operations would change the precision and final result of what
+  -- would otherwise be the same expressions with respect to single or
+  -- double precision IEEE floating point computations.
+    ArchX86_64 -> True
+    ArchX86    -> True
     _          -> False
+
 
 isSse4_2Enabled :: DynFlags -> Bool
 isSse4_2Enabled dflags = sseVersion dflags >= Just SSE42

@@ -49,7 +49,6 @@ import Outputable
 import Module
 import ErrUtils
 import DynFlags
-import Config
 import Panic
 import Util
 import StringBuffer     ( hGetStringBuffer )
@@ -258,16 +257,23 @@ compileOne' m_tc_result mHscMessage
                   then gopt_set dflags0 Opt_BuildDynamicToo
                   else dflags0
 
+       -- #16331 - when no "internal interpreter" is available but we
+       -- need to process some TemplateHaskell or QuasiQuotes, we automatically
+       -- turn on -fexternal-interpreter.
+       dflags2 = if not internalInterpreter && needsLinker
+                 then gopt_set dflags1 Opt_ExternalInterpreter
+                 else dflags1
+
        basename = dropExtension input_fn
 
        -- We add the directory in which the .hs files resides) to the import
        -- path.  This is needed when we try to compile the .hc file later, if it
        -- imports a _stub.h file that we created here.
        current_dir = takeDirectory basename
-       old_paths   = includePaths dflags1
+       old_paths   = includePaths dflags2
        !prevailing_dflags = hsc_dflags hsc_env0
        dflags =
-          dflags1 { includePaths = addQuoteInclude old_paths [current_dir]
+          dflags2 { includePaths = addQuoteInclude old_paths [current_dir]
                   , log_action = log_action prevailing_dflags }
                   -- use the prevailing log_action / log_finaliser,
                   -- not the one cached in the summary.  This is so
@@ -362,7 +368,7 @@ link ghcLink dflags
   = lookupHook linkHook l dflags ghcLink dflags
   where
     l LinkInMemory _ _ _
-      = if cGhcWithInterpreter == "YES"
+      = if sGhcWithInterpreter $ settings dflags
         then -- Not Linking...(demand linker will do the job)
              return Succeeded
         else panicBadLink LinkInMemory
@@ -1218,17 +1224,8 @@ runPhase (RealPhase cc_phase) input_fn dflags
 
         ghcVersionH <- liftIO $ getGhcVersionPathName dflags
 
-        let gcc_lang_opt | cc_phase `eqPhase` Ccxx    = "c++"
-                         | cc_phase `eqPhase` Cobjc   = "objective-c"
-                         | cc_phase `eqPhase` Cobjcxx = "objective-c++"
-                         | otherwise                  = "c"
-        liftIO $ SysTools.runCc dflags (
-                -- force the C compiler to interpret this file as C when
-                -- compiling .hc files, by adding the -x c option.
-                -- Also useful for plain .c files, just in case GHC saw a
-                -- -x c option.
-                        [ SysTools.Option "-x", SysTools.Option gcc_lang_opt
-                        , SysTools.FileOption "" input_fn
+        liftIO $ SysTools.runCc (phaseForeignLanguage cc_phase) dflags (
+                        [ SysTools.FileOption "" input_fn
                         , SysTools.Option "-o"
                         , SysTools.FileOption "" output_fn
                         ]
@@ -1917,7 +1914,7 @@ doCpp dflags raw input_fn output_fn = do
     let verbFlags = getVerbFlags dflags
 
     let cpp_prog args | raw       = SysTools.runCpp dflags args
-                      | otherwise = SysTools.runCc dflags (SysTools.Option "-E" : args)
+                      | otherwise = SysTools.runCc Nothing dflags (SysTools.Option "-E" : args)
 
     let target_defs =
           [ "-D" ++ HOST_OS     ++ "_BUILD_OS",

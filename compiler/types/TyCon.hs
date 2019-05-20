@@ -487,14 +487,22 @@ tyConVisibleTyVars tc
   = [ tv | Bndr tv vis <- tyConBinders tc
          , isVisibleTcbVis vis ]
 
-{- Note [AnonTCB InivsArg]
+{- Note [AnonTCB InvisArg]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 It's pretty rare to have an (AnonTCB InvisArg) binder.  The
-only way it can occur is in a PromotedDataCon whose
-kind has an equality constraint:
-  'MkT :: forall a b. (a~b) => blah
-See Note [Constraints in kinds] in TyCoRep, and
-Note [Promoted data constructors] in this module.
+only way it can occur is through equality constraints in kinds. These
+can arise in one of two ways:
+
+* In a PromotedDataCon whose kind has an equality constraint:
+
+    'MkT :: forall a b. (a~b) => blah
+
+  See Note [Constraints in kinds] in TyCoRep, and
+  Note [Promoted data constructors] in this module.
+* In a data type whose kind has an equality constraint, as in the
+  following example from #12102:
+
+    data T :: forall a. (IsTypeLit a ~ 'True) => a -> Type
 
 When mapping an (AnonTCB InvisArg) to an ArgFlag, in
 tyConBndrVisArgFlag, we use "Inferred" to mean "the user cannot
@@ -1328,12 +1336,12 @@ Roughly in order of "includes more information":
    number of bits.  It may represent a signed or unsigned integer, a
    floating-point value, or an address.
 
-    data Width = W8 | W16 | W32 | W64 | W80 | W128
+    data Width = W8 | W16 | W32 | W64  | W128
 
  - Size, which is used in the native code generator, is Width +
    floating point information.
 
-   data Size = II8 | II16 | II32 | II64 | FF32 | FF64 | FF80
+   data Size = II8 | II16 | II32 | II64 | FF32 | FF64
 
    it is necessary because e.g. the instruction to move a 64-bit float
    on x86 (movsd) is different from the instruction to move a 64-bit

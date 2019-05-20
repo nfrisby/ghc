@@ -2366,7 +2366,10 @@ commonly used commands.
     Typing ``:def`` on its own lists the currently-defined macros.
     Attempting to redefine an existing command name results in an error
     unless the ``:def!`` form is used, in which case the old command
-    with that name is silently overwritten.
+    with that name is silently overwritten. However for builtin commands
+    the old command can still be used by preceeding the command name with
+    a double colon (eg ``::load``).
+    It's not possible to redefine the commands ``:{``, ``:}`` and ``:!``.
 
 .. ghci-cmd:: :delete; * | ⟨num⟩ ...
 
@@ -2648,6 +2651,17 @@ commonly used commands.
 .. ghci-cmd:: :set editor; ⟨cmd⟩
 
     Sets the command used by :ghci-cmd:`:edit` to ⟨cmd⟩.
+
+.. ghci-cmd:: :set local-config; ⟨source|ignore⟩
+
+    If ``ignore``, :file:`./.ghci` files will be ignored (sourcing
+    untrusted local scripts is a security risk).   The default is
+    ``source``.  Set this directive in your user :file:`.ghci`
+    script, i.e. before the local script would be sourced.
+
+    Even when set to ``ignore``, a local script will still be
+    processed if given by :ghc-flag:`-ghci-script` on the command
+    line, or sourced via :ghci-cmd:`:script`.
 
 .. ghci-cmd:: :set prog; ⟨prog⟩
 
@@ -3101,15 +3115,14 @@ When it starts, unless the :ghc-flag:`-ignore-dot-ghci` flag is given, GHCi
 reads and executes commands from the following files, in this order, if
 they exist:
 
-1. :file:`./.ghci`
+1. :file:`{ghcappdata}/ghci.conf`, where ⟨ghcappdata⟩ depends on
+   your system, but is usually something like :file:`$HOME/.ghc` on
+   Unix or :file:`C:/Documents and Settings/user/Application
+   Data/ghc` on Windows.
 
-2. :file:`{appdata}/ghc/ghci.conf`, where ⟨appdata⟩ depends on your system,
-   but is usually something like
-   :file:`C:/Documents and Settings/user/Application Data`
+2. :file:`$HOME/.ghci`
 
-3. On Unix: :file:`$HOME/.ghc/ghci.conf`
-
-4. :file:`$HOME/.ghci`
+3. :file:`./.ghci`
 
 The :file:`ghci.conf` file is most useful for turning on favourite options
 (e.g. ``:set +s``), and defining useful macros.
@@ -3133,6 +3146,12 @@ three subdirectories A, B and C, you might put the following lines in
 (Note that strictly speaking the :ghc-flag:`-i` flag is a static one, but in
 fact it works to set it using :ghci-cmd:`:set` like this. The changes won't take
 effect until the next :ghci-cmd:`:load`, though.)
+
+.. warning::
+    Sourcing untrusted :file:`./.ghci` files is a security risk.
+    They can contain arbitrary commands that will be executed as the
+    user.  Use :ghci-cmd:`:set local-config` to inhibit the
+    processing of :file:`./.ghci` files.
 
 Once you have a library of GHCi macros, you may want to source them from
 separate files, or you may want to source your ``.ghci`` file into your
@@ -3166,8 +3185,9 @@ read:
     :type: dynamic
     :category:
 
-    Read a specific file after the usual startup files. Maybe be
+    Read a specific file after the usual startup files.  May be
     specified repeatedly for multiple inputs.
+    :ghc-flag:`-ignore-dot-ghci` does not apply to these files.
 
 When defining GHCi macros, there is some important behavior you should
 be aware of when names may conflict with built-in commands, especially

@@ -1,7 +1,7 @@
 The Glasgow Haskell Compiler
 ============================
 
-[![Build Status](https://api.travis-ci.org/ghc/ghc.svg?branch=master)](http://travis-ci.org/ghc/ghc)
+[![pipeline status](https://gitlab.haskell.org/ghc/ghc/badges/master/pipeline.svg?style=flat)](https://gitlab.haskell.org/ghc/ghc/commits/master)
 
 This is the source tree for [GHC][1], a compiler and interactive
 environment for the Haskell functional programming language.
@@ -26,7 +26,7 @@ There are two ways to get a source tree:
 
  2. *Check out the source code from git*
 
-        $ git clone --recursive git://git.haskell.org/ghc.git
+        $ git clone --recursive git@gitlab.haskell.org:ghc/ghc.git
 
   Note: cloning GHC from Github requires a special setup. See [Getting a GHC
   repository from Github][7].

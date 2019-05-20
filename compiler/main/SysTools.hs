@@ -177,6 +177,7 @@ initSysTools top_dir
                                  Nothing -> pgmError ("Failed to read " ++ show key ++ " value " ++ show xs)
                              Nothing -> pgmError ("No entry for " ++ show key ++ " in " ++ show settingsFile)
        crossCompiling <- getBooleanSetting "cross compiling"
+       targetPlatformString <- getSetting "target platform string"
        targetArch <- readSetting "target arch"
        targetOS <- readSetting "target os"
        targetWordSize <- readSetting "target word size"
@@ -184,6 +185,7 @@ initSysTools top_dir
        targetHasGnuNonexecStack <- readSetting "target has GNU nonexec stack"
        targetHasIdentDirective <- readSetting "target has .ident directive"
        targetHasSubsectionsViaSymbols <- readSetting "target has subsections via symbols"
+       tablesNextToCode <- getBooleanSetting "Tables next to code"
        myExtraGccViaCFlags <- getSetting "GCC extra via C opts"
        -- On Windows, mingw is distributed with GHC,
        -- so we look in TopDir/../mingw/bin,
@@ -199,15 +201,9 @@ initSysTools top_dir
        let unreg_gcc_args = if targetUnregisterised
                             then ["-DNO_REGS", "-DUSE_MINIINTERPRETER"]
                             else []
-           -- TABLES_NEXT_TO_CODE affects the info table layout.
-           tntc_gcc_args
-            | mkTablesNextToCode targetUnregisterised
-               = ["-DTABLES_NEXT_TO_CODE"]
-            | otherwise = []
            cpp_args= map Option (words cpp_args_str)
            gcc_args = map Option (words gcc_args_str
-                               ++ unreg_gcc_args
-                               ++ tntc_gcc_args)
+                               ++ unreg_gcc_args)
        ldSupportsCompactUnwind <- getBooleanSetting "ld supports compact unwind"
        ldSupportsBuildId       <- getBooleanSetting "ld supports build-id"
        ldSupportsFilelist      <- getBooleanSetting "ld supports filelist"
@@ -217,9 +213,9 @@ initSysTools top_dir
            ghc_usage_msg_path  = installed "ghc-usage.txt"
            ghci_usage_msg_path = installed "ghci-usage.txt"
 
-             -- For all systems, unlit, split, mangle are GHC utilities
-             -- architecture-specific stuff is done when building Config.hs
-           unlit_path = libexec cGHC_UNLIT_PGM
+       -- For all systems, unlit, split, mangle are GHC utilities
+       -- architecture-specific stuff is done when building Config.hs
+       unlit_path <- getToolSetting "unlit command"
 
        windres_path <- getToolSetting "windres command"
        libtool_path <- getToolSetting "libtool command"
@@ -263,6 +259,29 @@ initSysTools top_dir
                           platformIsCrossCompiling = crossCompiling
                       }
 
+       integerLibrary <- getSetting "integer library"
+       integerLibraryType <- case integerLibrary of
+         "integer-gmp" -> pure IntegerGMP
+         "integer-simple" -> pure IntegerSimple
+         _ -> pgmError $ unwords
+           [ "Entry for"
+           , show "integer library"
+           , "must be one of"
+           , show "integer-gmp"
+           , "or"
+           , show "integer-simple"
+           ]
+
+       ghcWithInterpreter <- getBooleanSetting "Use interpreter"
+       ghcWithNativeCodeGen <- getBooleanSetting "Use native code generator"
+       ghcWithSMP <- getBooleanSetting "Support SMP"
+       ghcRTSWays <- getSetting "RTS ways"
+       leadingUnderscore <- getBooleanSetting "Leading underscore"
+       useLibFFI <- getBooleanSetting "Use LibFFI"
+       ghcThreaded <- getBooleanSetting "Use Threads"
+       ghcDebugged <- getBooleanSetting "Use Debugging"
+       ghcRtsWithLibdw <- getBooleanSetting "RTS expects libdw"
+
        return $ Settings {
                     sTargetPlatform = platform,
                     sTmpDir         = normalise tmpdir,
@@ -301,6 +320,7 @@ initSysTools top_dir
                     sOpt_P_fingerprint = fingerprint0,
                     sOpt_F       = [],
                     sOpt_c       = [],
+                    sOpt_cxx     = [],
                     sOpt_a       = [],
                     sOpt_l       = [],
                     sOpt_windres = [],
@@ -308,7 +328,21 @@ initSysTools top_dir
                     sOpt_lo      = [],
                     sOpt_lc      = [],
                     sOpt_i       = [],
-                    sPlatformConstants = platformConstants
+                    sPlatformConstants = platformConstants,
+
+                    sTargetPlatformString = targetPlatformString,
+                    sIntegerLibrary = integerLibrary,
+                    sIntegerLibraryType = integerLibraryType,
+                    sGhcWithInterpreter = ghcWithInterpreter,
+                    sGhcWithNativeCodeGen = ghcWithNativeCodeGen,
+                    sGhcWithSMP = ghcWithSMP,
+                    sGhcRTSWays = ghcRTSWays,
+                    sTablesNextToCode = tablesNextToCode,
+                    sLeadingUnderscore = leadingUnderscore,
+                    sLibFFI = useLibFFI,
+                    sGhcThreaded = ghcThreaded,
+                    sGhcDebugged = ghcDebugged,
+                    sGhcRtsWithLibdw = ghcRtsWithLibdw
              }
 
 
@@ -384,10 +418,12 @@ linkDynLib dflags0 o_files dep_packages
         -- against libHSrts, then both end up getting loaded,
         -- and things go wrong. We therefore link the libraries
         -- with the same RTS flags that we link GHC with.
-        dflags1 = if cGhcThreaded then addWay' WayThreaded dflags0
-                                  else                     dflags0
-        dflags2 = if cGhcDebugged then addWay' WayDebug dflags1
-                                  else                  dflags1
+        dflags1 = if sGhcThreaded $ settings dflags0
+          then addWay' WayThreaded dflags0
+          else                     dflags0
+        dflags2 = if sGhcDebugged $ settings dflags1
+          then addWay' WayDebug dflags1
+          else                  dflags1
         dflags = updateWays dflags2
 
         verbFlags = getVerbFlags dflags

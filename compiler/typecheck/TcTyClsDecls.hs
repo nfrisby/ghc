@@ -73,7 +73,9 @@ import BasicTypes
 import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
+import Data.Foldable
 import Data.List
+import qualified Data.List.NonEmpty as NE
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.Set as Set
 
@@ -288,7 +290,7 @@ we can get away with this is because we have more systematic TYPE r
 inference, which means that we can do unification between kinds that
 aren't lifted (this historically was not true.)
 
-The downside of not directly reading off the kinds off the RHS of
+The downside of not directly reading off the kinds of the RHS of
 type synonyms in topological order is that we don't transparently
 support making synonyms of types with higher-rank kinds.  But
 you can always specify a CUSK directly to make this work out.
@@ -313,6 +315,23 @@ a CUSK.  Here we skip the RHS of T, so we eventually get
 This gets us more polymorphism than we would otherwise get, similar
 (but implemented strangely differently from) the treatment of type
 signatures in value declarations.
+
+However, we only want to do so when we have PolyKinds.
+When we have NoPolyKinds, we don't skip those decls, because we have defaulting
+(#16609). Skipping won't bring us more polymorphism when we have defaulting.
+Consider
+
+  data T1 a = MkT1 T2        -- No CUSK
+  data T2 = MkT2 (T1 Maybe)  -- Has CUSK
+
+If we skip the rhs of T2 during kind-checking, the kind of a remains unsolved.
+With PolyKinds, we do generalization to get T1 :: forall a. a -> *. And the
+program type-checks.
+But with NoPolyKinds, we do defaulting to get T1 :: * -> *. Defaulting happens
+in quantifyTyVars, which is called from generaliseTcTyCon. Then type-checking
+(T1 Maybe) will throw a type error.
+
+Summary: with PolyKinds, we must skip; with NoPolyKinds, we must /not/ skip.
 
 Open type families
 ~~~~~~~~~~~~~~~~~~
@@ -405,9 +424,9 @@ We do the following steps:
             B   :-> TyConPE
             MkB :-> DataConPE
 
-  2. kcTyCLGruup
+  2. kcTyCLGroup
       - Do getInitialKinds, which will signal a promotion
-        error if B is used in any of the kinds needed to initialse
+        error if B is used in any of the kinds needed to initialise
         B's kind (e.g. (a :: Type)) here
 
       - Extend the type env with these initial kinds (monomorphic for
@@ -491,8 +510,9 @@ kcTyClGroup decls
           --    3. Generalise the inferred kinds
           -- See Note [Kind checking for type and class decls]
 
+        ; cusks_enabled <- xoptM LangExt.CUSKs
         ; let (cusk_decls, no_cusk_decls)
-                 = partition (hsDeclHasCusk . unLoc) decls
+                 = partition (hsDeclHasCusk cusks_enabled . unLoc) decls
 
         ; poly_cusk_tcs <- getInitialKinds True cusk_decls
 
@@ -512,8 +532,10 @@ kcTyClGroup decls
                     -- NB: the environment extension overrides the tycon
                     --     promotion-errors bindings
                     --     See Note [Type environment evolution]
+                  ; poly_kinds  <- xoptM LangExt.PolyKinds
                   ; tcExtendKindEnvWithTyCons mono_tcs $
-                    mapM_ kcLTyClDecl no_cusk_decls
+                    mapM_ kcLTyClDecl (if poly_kinds then no_cusk_decls else decls)
+                    -- See Note [Skip decls with CUSKs in kcLTyClDecl]
 
                   ; return mono_tcs }
 
@@ -810,8 +832,8 @@ We do kind inference as follows:
       Note [Unification variables need fresh Names]
 
   Assign initial monomorophic kinds to S, T
-          S :: kk1 -> * -> kk2 -> *
-          T :: kk3 -> * -> kk4 -> *
+          T :: kk1 -> * -> kk2 -> *
+          S :: kk3 -> * -> kk4 -> *
 
 * Step 2: kcTyClDecl. Extend the environment with a TcTyCon for S and
   T, with these monomophic kinds.  Now kind-check the declarations,
@@ -900,7 +922,7 @@ But when typechecking the default declarations for 'cop' and 'dop' in
 tcDlassDecl2 we need {a, ka} and {b, kb} respectively to be in scope.
 But at that point all we have is the utterly-final Class itself.
 
-Conclusion: the classTyVars of a class must have the same Mame as
+Conclusion: the classTyVars of a class must have the same Name as
 that originally assigned by the user.  In our example, C must have
 classTyVars {a, ka, x} while D has classTyVars {a, kb, y}.  Despite
 the fact that kka and kkb got unified!
@@ -1019,17 +1041,25 @@ getInitialKind cusk (FamDecl { tcdFam = decl })
 getInitialKind cusk (SynDecl { tcdLName = dL->L _ name
                              , tcdTyVars = ktvs
                              , tcdRhs = rhs })
-  = do  { tycon <- kcLHsQTyVars name TypeSynonymFlavour cusk ktvs $
-                   case kind_annotation rhs of
+  = do  { cusks_enabled <- xoptM LangExt.CUSKs
+        ; tycon <- kcLHsQTyVars name TypeSynonymFlavour cusk ktvs $
+                   case kind_annotation cusks_enabled rhs of
                      Just ksig -> tcLHsKindSig (TySynKindCtxt name) ksig
-                     Nothing   -> newMetaKindVar
+                     Nothing -> newMetaKindVar
         ; return [tycon] }
   where
     -- Keep this synchronized with 'hsDeclHasCusk'.
-    kind_annotation (dL->L _ ty) = case ty of
-        HsParTy _ lty     -> kind_annotation lty
-        HsKindSig _ _ k   -> Just k
-        _                 -> Nothing
+    kind_annotation
+      :: Bool           --  cusks_enabled?
+      -> LHsType GhcRn  --  rhs
+      -> Maybe (LHsKind GhcRn)
+    kind_annotation False = const Nothing
+    kind_annotation True = go
+      where
+        go (dL->L _ ty) = case ty of
+          HsParTy _ lty     -> go lty
+          HsKindSig _ _ k   -> Just k
+          _                 -> Nothing
 
 getInitialKind _ (DataDecl _ _ _ _ (XHsDataDefn _)) = panic "getInitialKind"
 getInitialKind _ (XTyClDecl _) = panic "getInitialKind"
@@ -1053,18 +1083,20 @@ getFamDeclInitialKind parent_cusk mb_parent_tycon
                      , fdTyVars    = ktvs
                      , fdResultSig = (dL->L _ resultSig)
                      , fdInfo      = info })
-  = kcLHsQTyVars name flav fam_cusk ktvs $
-    case resultSig of
-      KindSig _ ki                              -> tcLHsKindSig ctxt ki
-      TyVarSig _ (dL->L _ (KindedTyVar _ _ ki)) -> tcLHsKindSig ctxt ki
-      _ -- open type families have * return kind by default
-        | tcFlavourIsOpen flav              -> return liftedTypeKind
-               -- closed type families have their return kind inferred
-               -- by default
-        | otherwise                         -> newMetaKindVar
+  = do { cusks_enabled <- xoptM LangExt.CUSKs
+       ; kcLHsQTyVars name flav (fam_cusk cusks_enabled) ktvs $
+         case resultSig of
+           KindSig _ ki                              -> tcLHsKindSig ctxt ki
+           TyVarSig _ (dL->L _ (KindedTyVar _ _ ki)) -> tcLHsKindSig ctxt ki
+           _ -- open type families have * return kind by default
+             | tcFlavourIsOpen flav              -> return liftedTypeKind
+                    -- closed type families have their return kind inferred
+                    -- by default
+             | otherwise                         -> newMetaKindVar
+       }
   where
     assoc_with_no_cusk = isJust mb_parent_tycon && not parent_cusk
-    fam_cusk = famDeclHasCusk assoc_with_no_cusk decl
+    fam_cusk cusks_enabled = famDeclHasCusk cusks_enabled assoc_with_no_cusk decl
     flav = case info of
       DataFamily         -> DataFamilyFlavour mb_parent_tycon
       OpenTypeFamily     -> OpenTypeFamilyFlavour mb_parent_tycon
@@ -1497,7 +1529,7 @@ tcDefaultAssocDecl fam_tc [dL->L loc (FamEqn { feqn_tycon = L _ tc_name
   = -- See Note [Type-checking default assoc decls]
     setSrcSpan loc $
     tcAddFamInstCtxt (text "default type instance") tc_name $
-    do { traceTc "tcDefaultAssocDecl" (ppr tc_name)
+    do { traceTc "tcDefaultAssocDecl 1" (ppr tc_name)
        ; let fam_tc_name = tyConName fam_tc
              fam_arity = length (tyConVisibleTyVars fam_tc)
 
@@ -1524,14 +1556,75 @@ tcDefaultAssocDecl fam_tc [dL->L loc (FamEqn { feqn_tycon = L _ tc_name
                                                     imp_vars exp_vars
                                                     hs_pats hs_rhs_ty
 
-         -- See Note [Type-checking default assoc decls]
-       ; traceTc "tcDefault" (vcat [ppr (tyConTyVars fam_tc), ppr qtvs, ppr pats])
-       ; case tcMatchTys pats (mkTyVarTys (tyConTyVars fam_tc)) of
-           Just subst -> return (Just (substTyUnchecked subst rhs_ty, loc) )
-           Nothing    -> failWithTc (defaultAssocKindErr fam_tc)
-           -- We check for well-formedness and validity later,
-           -- in checkValidClass
+       ; let fam_tvs = tyConTyVars fam_tc
+             ppr_eqn = ppr_default_eqn pats rhs_ty
+       ; traceTc "tcDefaultAssocDecl 2" (vcat
+           [ text "fam_tvs" <+> ppr fam_tvs
+           , text "qtvs"    <+> ppr qtvs
+           , text "pats"    <+> ppr pats
+           , text "rhs_ty"  <+> ppr rhs_ty
+           ])
+       ; pat_tvs <- traverse (extract_tv ppr_eqn) pats
+       ; check_all_distinct_tvs ppr_eqn pat_tvs
+       ; let subst = zipTvSubst pat_tvs (mkTyVarTys fam_tvs)
+       ; pure $ Just (substTyUnchecked subst rhs_ty, loc)
+           -- We also perform other checks for well-formedness and validity
+           -- later, in checkValidClass
      }
+  where
+    -- Checks that a pattern on the LHS of a default is a type
+    -- variable. If so, return the underlying type variable, and if
+    -- not, throw an error.
+    -- See Note [Type-checking default assoc decls]
+    extract_tv :: SDoc   -- The pretty-printed default equation
+                         -- (only used for error message purposes)
+               -> Type   -- The particular type pattern from which to extract
+                         -- its underlying type variable
+               -> TcM TyVar
+    extract_tv ppr_eqn pat =
+      case getTyVar_maybe pat of
+        Just tv -> pure tv
+        Nothing ->
+          -- Per Note [Type-checking default assoc decls], we already
+          -- know by this point that if any arguments in the default
+          -- instance aren't type variables, then they must be
+          -- invisible kind arguments. Therefore, always display the
+          -- error message with -fprint-explicit-kinds enabled.
+          failWithTc $ pprWithExplicitKindsWhen True $
+          hang (text "Illegal argument" <+> quotes (ppr pat) <+> text "in:")
+             2 (vcat [ppr_eqn, suggestion])
+
+
+    -- Checks that no type variables in an associated default declaration are
+    -- duplicated. If that is the case, throw an error.
+    -- See Note [Type-checking default assoc decls]
+    check_all_distinct_tvs :: SDoc    -- The pretty-printed default equation
+                                      -- (only used for error message purposes)
+                           -> [TyVar] -- The type variable arguments in the
+                                      -- associated default declaration
+                           -> TcM ()
+    check_all_distinct_tvs ppr_eqn tvs =
+      let dups = findDupsEq (==) tvs in
+      traverse_
+        (\d -> -- Per Note [Type-checking default assoc decls], we already
+               -- know by this point that if any arguments in the default
+               -- instance are duplicates, then they must be
+               -- invisible kind arguments. Therefore, always display the
+               -- error message with -fprint-explicit-kinds enabled.
+               failWithTc $ pprWithExplicitKindsWhen True $
+               hang (text "Illegal duplicate variable"
+                       <+> quotes (ppr (NE.head d)) <+> text "in:")
+                  2 (vcat [ppr_eqn, suggestion]))
+        dups
+
+    ppr_default_eqn :: [Type] -> Type -> SDoc
+    ppr_default_eqn pats rhs_ty =
+      quotes (text "type" <+> ppr (mkTyConApp fam_tc pats)
+                <+> equals <+> ppr rhs_ty)
+
+    suggestion :: SDoc
+    suggestion = text "The arguments to" <+> quotes (ppr fam_tc)
+             <+> text "must all be distinct type variables"
 tcDefaultAssocDecl _ [dL->L _ (XFamEqn _)] = panic "tcDefaultAssocDecl"
 tcDefaultAssocDecl _ [dL->L _ (FamEqn _ _ _ (XLHsQTyVars _) _ _)]
   = panic "tcDefaultAssocDecl"
@@ -1544,8 +1637,8 @@ tcDefaultAssocDecl _ [_]
 Consider this default declaration for an associated type
 
    class C a where
-      type F (a :: k) b :: *
-      type F x y = Proxy x -> y
+      type F (a :: k) b :: Type
+      type F (x :: j) y = Proxy x -> y
 
 Note that the class variable 'a' doesn't scope over the default assoc
 decl (rather oddly I think), and (less oddly) neither does the second
@@ -1555,17 +1648,44 @@ instance.
 
 However we store the default rhs (Proxy x -> y) in F's TyCon, using
 F's own type variables, so we need to convert it to (Proxy a -> b).
-We do this by calling tcMatchTys to match them up.  This also ensures
-that x's kind matches a's and similarly for y and b.  The error
-message isn't great, mind you.  (#11361 was caused by not doing a
-proper tcMatchTys here.)
+We do this by creating a substitution [j |-> k, x |-> a, b |-> y] and
+applying this substitution to the RHS.
 
-Recall also that the left-hand side of an associated type family
-default is always just variables -- no tycons here. Accordingly,
-the patterns used in the tcMatchTys won't actually be knot-tied,
-even though we're in the knot. This is too delicate for my taste,
-but it works.
+In order to create this substitution, we must first ensure that all of
+the arguments in the default instance consist of distinct type variables.
+This property has already been checked to some degree earlier in the compiler:
+RdrHsSyn.checkTyVars ensures that all visible type arguments are type
+variables, and RnTypes.bindLHsTyVarBndrs ensures that no visible type arguments
+are duplicated. But these only check /visible/ arguments, however, so we still
+must check the invisible kind arguments to see if these invariants are upheld.
 
+First, we must check that all arguments are type variables. As a motivating
+example, consider this erroneous program (inspired by #11361):
+
+   class C a where
+      type F (a :: k) b :: Type
+      type F x        b = x
+
+If you squint, you'll notice that the kind of `x` is actually Type. However,
+we cannot substitute from [Type |-> k], so we reject this default.
+
+Next, we must check that all arguments are distinct. Here is another offending
+example, this time taken from #13971:
+
+   class C2 (a :: j) where
+      type F2 (a :: j) (b :: k)
+      type F2 (x :: z) (y :: z) = z
+
+All of the arguments in the default equation for `F2` are type variables, so
+that passes the first check. However, if we were to build this substitution,
+then both `j` and `k` map to `z`! In terms of visible kind application, it's as
+if we had written `type F2 @z @z x y = z`, which makes it clear that we have
+duplicated a use of `z`. Therefore, `F2`'s default is also rejected.
+
+Since the LHS of an associated type family default is always just variables,
+it won't contain any tycons. Accordingly, the patterns used in the substitution
+won't actually be knot-tied, even though we're in the knot. This is too
+delicate for my taste, but it works.
 -}
 
 {- *********************************************************************
@@ -3848,11 +3968,6 @@ wrongNumberOfParmsErr :: Arity -> SDoc
 wrongNumberOfParmsErr max_args
   = text "Number of parameters must match family declaration; expected"
     <+> ppr max_args
-
-defaultAssocKindErr :: TyCon -> SDoc
-defaultAssocKindErr fam_tc
-  = text "Kind mis-match on LHS of default declaration for"
-    <+> quotes (ppr fam_tc)
 
 badRoleAnnot :: Name -> Role -> Role -> SDoc
 badRoleAnnot var annot inferred

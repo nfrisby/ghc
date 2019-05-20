@@ -2109,6 +2109,38 @@ data constructor in an import or export list with the keyword
 ``pattern``, to allow the import or export of a data constructor without
 its parent type constructor (see :ref:`patsyn-impexp`).
 
+.. _importqualifiedpost:
+
+Writing qualified in postpositive position
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. extension:: ImportQualifiedPost
+    :shortdesc: ``ImportQualifiedPost`` allows the syntax ``import M qualified``
+
+    :since: 8.10.1
+
+    ``ImportQualifiedPost`` allows the syntax ``import M qualified``, that is, to annotate a module as qualified by writing ``qualified`` after the module name.
+
+To import a qualified module usually you must specify ``qualified`` in prepositive position : ``import qualified M``. This often leads to a "hanging indent" (which is automatically inserted by some autoformatters and common in many code bases. For example:
+
+.. code-block::  none
+
+ import qualified A
+ import           B
+ import           C
+
+The ``ImportQualifiedPost`` extension allows ``qualified`` to appear in postpositive position : ``import M qualified``. With this extension enabled, one can write:
+
+.. code-block:: none
+
+   import A qualified
+   import B
+   import C
+
+It is an error if ``qualified`` appears in both pre and postpositive positions.
+
+The warning ``-Wprepositive-qualified-syntax`` (off by default) reports on any occurrences of imports annotated ``qualified`` using prepositive syntax.
+
 .. _block-arguments:
 
 More liberal syntax for function arguments
@@ -3787,7 +3819,7 @@ Haskell 98 allows the programmer to add a deriving clause to a data type
 declaration, to generate a standard instance declaration for specified class.
 GHC extends this mechanism along several axes:
 
-* The derivation mechanism can be used separtely from the data type
+* The derivation mechanism can be used separately from the data type
   declaration, using the `standalone deriving mechanism
   <#stand-alone-deriving>`__.
 
@@ -4531,7 +4563,8 @@ Deriving ``Lift`` instances
 The class ``Lift``, unlike other derivable classes, lives in
 ``template-haskell`` instead of ``base``. Having a data type be an instance of
 ``Lift`` permits its values to be promoted to Template Haskell expressions (of
-type ``ExpQ``), which can then be spliced into Haskell source code.
+type ``ExpQ`` and ``TExpQ a``), which can then be spliced into Haskell source
+code.
 
 Here is an example of how one can derive ``Lift``:
 
@@ -4546,17 +4579,11 @@ Here is an example of how one can derive ``Lift``:
 
     {-
     instance (Lift a) => Lift (Foo a) where
-        lift (Foo a)
-        = appE
-            (conE
-                (mkNameG_d "package-name" "Bar" "Foo"))
-            (lift a)
-        lift (u :^: v)
-        = infixApp
-            (lift u)
-            (conE
-                (mkNameG_d "package-name" "Bar" ":^:"))
-            (lift v)
+        lift (Foo a) = [| Foo a |]
+        lift ((:^:) u v) = [| (:^:) u v |]
+
+        liftTyped (Foo a) = [|| Foo a ||]
+        liftTyped ((:^:) u v) = [|| (:^:) u v ||]
     -}
 
     -----
@@ -4572,8 +4599,9 @@ Here is an example of how one can derive ``Lift``:
     fooExp :: Lift a => Foo a -> Q Exp
     fooExp f = [| f |]
 
-:extension:`DeriveLift` also works for certain unboxed types (``Addr#``, ``Char#``,
-``Double#``, ``Float#``, ``Int#``, and ``Word#``):
+Note that the ``Lift`` typeclass takes advantage of :ref:`runtime-rep` in order
+to support instances involving unboxed types. This means :extension:`DeriveLift`
+also works for these types:
 
 ::
 
@@ -4587,12 +4615,8 @@ Here is an example of how one can derive ``Lift``:
 
     {-
     instance Lift IntHash where
-        lift (IntHash i)
-        = appE
-            (conE
-                (mkNameG_d "package-name" "Unboxed" "IntHash"))
-            (litE
-                (intPrimL (toInteger (I# i))))
+        lift (IntHash i) = [| IntHash i |]
+        liftTyped (IntHash i) = [|| IntHash i ||]
     -}
 
 
@@ -8988,6 +9012,11 @@ do so.
 Complete user-supplied kind signatures and polymorphic recursion
 ----------------------------------------------------------------
 
+.. extension:: CUSKs
+    :shortdesc: Enable detection of complete user-supplied kind signatures.
+
+    :since: 8.10.1
+
 Just as in type inference, kind inference for recursive types can only
 use *monomorphic* recursion. Consider this (contrived) example: ::
 
@@ -9085,6 +9114,13 @@ example, consider ::
 
 According to the rules above ``X`` has a CUSK. Yet, the kind of ``k`` is undetermined.
 It is thus quantified over, giving ``X`` the kind ``forall k1 (k :: k1). Proxy k -> Type``.
+
+The detection of CUSKs is enabled by the :extension:`CUSKs` flag, which is
+switched on by default. When :extension:`CUSKs` is switched off, there is
+currently no way to enable polymorphic recursion in types. In the future, the
+notion of a CUSK will be replaced by top-level kind signatures
+(`GHC Proposal #36 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0036-kind-signatures.rst>`__),
+then, after a transition period, this extension will be turned off by default, and eventually removed.
 
 Kind inference in closed type families
 --------------------------------------
@@ -9403,7 +9439,8 @@ Here is an example of a constrained kind: ::
 The declarations above are accepted. However, if we add ``MkOther :: T Int``,
 we get an error that the equality constraint is not satisfied; ``Int`` is
 not a type literal. Note that explicitly quantifying with ``forall a`` is
-not necessary here.
+necessary in order for ``T`` to typecheck
+(see :ref:`complete-kind-signatures`).
 
 The kind ``Type``
 -----------------
@@ -9632,7 +9669,17 @@ when printing, and printing ``TYPE 'LiftedRep`` as ``Type`` (or ``*`` when
 :extension:`StarIsType` is on).
 
 Should you wish to see levity polymorphism in your types, enable
-the flag :ghc-flag:`-fprint-explicit-runtime-reps`.
+the flag :ghc-flag:`-fprint-explicit-runtime-reps`. For example,
+
+    .. code-block:: none
+
+        ghci> :t ($)
+        ($) :: (a -> b) -> a -> b
+        ghci> :set -fprint-explicit-runtime-reps
+        ghci> :t ($)
+        ($)
+          :: forall (r :: GHC.Types.RuntimeRep) a (b :: TYPE r).
+             (a -> b) -> a -> b
 
 .. _type-level-literals:
 
@@ -10359,13 +10406,13 @@ function that can *never* be called, such as this one: ::
       f :: (Int ~ Bool) => a -> a
 
 Sometimes :extension:`AllowAmbiguousTypes` does not mix well with :extension:`RankNTypes`.
-For example: :: 
+For example: ::
       foo :: forall r. (forall i. (KnownNat i) => r) -> r
       foo f = f @1
 
       boo :: forall j. (KnownNat j) => Int
       boo = ....
-          
+
       h :: Int
       h = foo boo
 
@@ -10375,7 +10422,7 @@ the type variables `j` and `i`.
 Unlike the previous examples, it is not currently possible
 to resolve the ambiguity manually by using :extension:`TypeApplications`.
 
-       
+
 .. note::
     *A historical note.* GHC used to impose some more restrictive and less
     principled conditions on type signatures. For type
@@ -10890,7 +10937,7 @@ We say that the type variables in ``f`` are *specified*, while those in
 a type variable in the source program, it is *specified*; if not, it is
 *inferred*.
 
-Thus rule applies in datatype declarations, too. For example, if we have
+This rule applies in datatype declarations, too. For example, if we have
 ``data Proxy a = Proxy`` (and :extension:`PolyKinds` is enabled), then
 ``a`` will be assigned kind ``k``, where ``k`` is a fresh kind variable.
 Because ``k`` was not written by the user, it will be unavailable for

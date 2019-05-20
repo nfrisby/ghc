@@ -393,9 +393,14 @@ test ('T15164',
       compile,
       ['-v0 -O'])
 
-test('T16190',
-      [ collect_stats(),
-        when(opsys('mingw32'), expect_broken(16389))
+# See https://gitlab.haskell.org/ghc/ghc/merge_requests/312#note_186960
+test ('WWRec',
+      [ collect_compiler_stats('bytes allocated',10)
       ],
+      compile,
+      ['-v0 -O'])
+
+test('T16190',
+      collect_stats(),
       multimod_compile,
       ['T16190.hs', '-v0'])
