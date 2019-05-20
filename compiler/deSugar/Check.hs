@@ -109,7 +109,8 @@ data PmPat :: PatTy -> * where
   PmNLit :: { pm_lit_id   :: Id
             , pm_lit_not  :: [PmLit] } -> PmPat 'VA
   PmNCon :: { pm_con_id   :: Id
-            , pm_con_sets :: [[ConLike]] } -> PmPat 'VA
+            , pm_con_grps :: [[ConLike]]
+            , pm_con_not  :: [ConLike] } -> PmPat 'VA
   PmGrd  :: { pm_grd_pv   :: PatVec
             , pm_grd_expr :: PmExpr } -> PmPat 'PAT
   -- | A fake guard pattern (True <- _) used to represent cases we cannot handle.
@@ -628,21 +629,29 @@ tmTyCsAreSatisfiable
 -- rendered vacuous by equality constraints.
 normaliseUncovered :: Uncovered -> PmM Uncovered
 normaliseUncovered us = do
-  us' <- filterM valvec_inhabited us
-  -- TODO: We could first check for any obviously empty COMPLETE sets before
-  -- asking pmIsSatisfiable
-  tracePm "normaliseUncovered" (vcat (map pprValVecDebug us))
-  pure us'
-  where
-    allM p = foldM (\b a -> if b then p a else pure False) True
-    valvec_inhabited (ValVec vva delta) = allM (valabs_inhabited delta) vva
-    anyM p = foldM (\b a -> if b then pure True else p a) False
-    valabs_inhabited delta v = case v :: ValAbs of
-      PmNCon{} -> allM (anyM (con_inhabited delta (pm_con_id v))) (pm_con_sets v)
-      _ -> pure True
-    con_inhabited delta x con = do
-      ic <- mkOneConFull x con
-      isJust <$> pmIsSatisfiable delta (ic_tm_ct ic) (ic_ty_cs ic) (ic_strict_arg_tys ic)
+  let allM p = foldM (\b a -> if b then p a else pure False) True
+      anyM p = foldM (\b a -> if b then pure True else p a) False
+      valvec_inhabited p (ValVec vva delta) = allM (valabs_inhabited (p delta)) vva
+      valabs_inhabited p v = case v :: ValAbs of
+        -- TODO: There's no easy way to call allCompleteMatches only from
+        -- knowing x's idType. Maybe this doesn't matter.
+        -- PmVar x -> var_inh (p x) []
+        PmNCon x grps ncons -> var_inh (p x) grps ncons
+        _ -> pure True
+      var_inh p groups ncons =
+        allM (anyM p . filter (`notElem` ncons)) groups
+
+  -- We'll first do a cheap sweep without consulting the oracles
+  let cheap_inh_test _ _ _ = pure True
+  us1 <- filterM (valvec_inhabited cheap_inh_test) us
+  -- Then we'll do another pass trying to weed out the rest with (in)equalities
+  let actual_inh_test delta x con = do
+        ic <- mkOneConFull x con
+        tracePm "nrm" (ppr con <+> ppr x <+> ppr (delta_tm_cs delta))
+        isJust <$> pmIsSatisfiable delta (ic_tm_ct ic) (ic_ty_cs ic) (ic_strict_arg_tys ic)
+  us2 <- filterM (valvec_inhabited actual_inh_test) us1
+  tracePm "normaliseUncovered" (vcat (map pprValVecDebug us2))
+  pure us2
 
 -- | Implements two performance optimizations, as described in the
 -- \"Strict argument type constraints\" section of
@@ -1219,6 +1228,7 @@ translateMatch fam_insts (dL->L _ (Match { m_pats = lpats, m_grhss = grhss })) =
   do
   pats'   <- concat <$> translatePatVec fam_insts pats
   guards' <- mapM (translateGuards fam_insts) guards
+  -- tracePm "translateMatch" (vcat [ppr pats, ppr pats', ppr guards, ppr guards'])
   return (pats', guards')
   where
     extractGuards :: LGRHS GhcTc (LHsExpr GhcTc) -> [GuardStmt GhcTc]
@@ -1395,10 +1405,17 @@ efficiently, which gave rise to #11276. The original approach translated
 
     pat |> co    ===>    x (pat <- (e |> co))
 
-Instead, we now check whether the coercion is a hole or if it is just refl, in
-which case we can drop it. Unfortunately, data families generate useful
-coercions so guards are still generated in these cases and checking data
-families is not really efficient.
+Why did we do this seemingly unnecessary expansion in the first place?
+The reason is that the type of @pat |> co@ (which is the type of the value
+abstraction we match against) might be different than that of @pat@. Data
+instances such as @Sing (a :: Bool)@ are a good example of this: If we would
+just drop the coercion, we'd get a type error when matching @pat@ against its
+value abstraction, with the result being that pmIsSatisfiable decides that every
+possible data constructor fitting @pat@ is rejected as uninhabitated, leading to
+a lot of false warnings.
+
+But we can check whether the coercion is a hole or if it is just refl, in
+which case we can drop it.
 
 %************************************************************************
 %*                                                                      *
@@ -1994,10 +2011,13 @@ pmcheck (PmFake : ps) guards vva =
 pmcheck (p : ps) guards (ValVec vas delta)
   | PmGrd { pm_grd_pv = pv, pm_grd_expr = e } <- p
   = do
+      tracePm "PmGrd: pmPatType" (hcat [ppr p, ppr (pmPatType p)])
       y <- mkPmId (pmPatType p)
       let tm_state = extendSubst y e (delta_tm_cs delta)
           delta'   = delta { delta_tm_cs = tm_state }
-      utail <$> pmcheckI (pv ++ ps) guards (ValVec (PmVar y : vas) delta')
+      pr <- pmcheckI (pv ++ ps) guards (ValVec (PmVar y : vas) delta')
+      us <- normaliseUncovered (presultUncovered pr)
+      pure $ utail pr { presultUncovered = us }
 
 pmcheck [] _ (ValVec (_:_) _) = panic "pmcheck: nil-cons"
 pmcheck (_:_) _ (ValVec [] _) = panic "pmcheck: cons-nil"
@@ -2060,16 +2080,13 @@ pmcheckHd (PmLit l1) ps guards (va@(PmLit l2)) vva =
     False -> return $ ucon va (usimple [vva])
 
 -- ConVar
-pmcheckHd p@PmCon{} ps guards (PmVar x) vva = do
-  incomplete_sets <- map snd <$> allCompleteMatches (pm_con_con p) (pm_con_arg_tys p)
-  --tracePm "ConVar" (vcat [ppr p, ppr x, ppr incomplete_sets])
-  -- Not all matches are satisfiable, but we will check this as we go, so that
-  -- we don't check satisfiability for every ConLike when we hit a wildcard
-  -- match later on anyway. We finally do so in 'normaliseUncovered'.
-  pmcheckHd p ps guards (PmNCon x incomplete_sets) vva
+pmcheckHd p@PmCon{} ps guards (PmVar x) vva@(ValVec _ delta) = do
+  groups <- map snd <$> allCompleteMatches (pm_con_con p) (pm_con_arg_tys p)
+  force_if (canDiverge (idName x) (delta_tm_cs delta)) <$>
+    pmcheckHd p ps guards (PmNCon x groups []) vva
 
 -- ConNCon
-pmcheckHd p@PmCon{} ps guards (PmNCon x sets) (ValVec vva delta) = do
+pmcheckHd p@PmCon{} ps guards (PmNCon x grps ncons) (ValVec vva delta) = do
   -- Split the value vector into two value vectors: One representing the current
   -- constructor, the other representing the other constructors of every
   -- Complete match set.
@@ -2079,20 +2096,23 @@ pmcheckHd p@PmCon{} ps guards (PmNCon x sets) (ValVec vva delta) = do
   -- checking the the current case, so we get back a PartialResult
   ic <- mkOneConFull x con
   pr_con <- fmap (fromMaybe mempty) $ runMaybeT $ do
-    guard (any (elem con) sets)
+    guard (con `notElem` ncons)
     delta' <- MaybeT $ pmIsSatisfiable delta (ic_tm_ct ic) (ic_ty_cs ic) (ic_strict_arg_tys ic)
+    lift $ tracePm "success" (ppr (delta_tm_cs delta))
     lift $ pmcheckHdI p ps guards (ic_val_abs ic) (ValVec vva delta')
 
-  let sets' = map (filter (/= con)) sets
+  let ncons' = con : ncons
   let us_incomplete
-        | all notNull sets' -- there weren't any obvious complete matches
-        , Just tm_state <- solveOneEq (delta_tm_cs delta) (mkNegEq x (vaToPmExpr (ic_val_abs ic)))
-        = [ValVec (PmNCon x sets' : vva) (delta { delta_tm_cs = tm_state })]
+        | let nalt = expectJust "ConNCon" $ pmExprToAlt (vaToPmExpr (ic_val_abs ic))
+        , Just tm_state <- addSolveRefutableAltCon (delta_tm_cs delta) x nalt
+        = [ValVec (PmNCon x grps ncons' : vva) (delta { delta_tm_cs = tm_state })]
         | otherwise = []
+  us_incomplete' <- normaliseUncovered us_incomplete
+  tracePm "ConNCon" (vcat [ppr p, ppr x, ppr ncons', ppr pr_con, ppr us_incomplete, ppr us_incomplete'])
 
   -- Combine both into a single PartialResult
-  let pr_combined = mkUnion pr_con (usimple us_incomplete)
-  pure $ force_if (canDiverge (idName x) (delta_tm_cs delta)) pr_combined
+  let pr_combined = mkUnion pr_con (usimple us_incomplete')
+  pure pr_combined
 
 -- LitVar
 pmcheckHd (p@(PmLit l)) ps guards (PmVar x) (ValVec vva delta)
@@ -2696,7 +2716,7 @@ tracePm herald doc = do
 pprPmPatDebug :: PmPat a -> SDoc
 pprPmPatDebug (PmCon cc _arg_tys _con_tvs _con_dicts con_args)
   = hsep [text "PmCon", ppr cc, hsep (map pprPmPatDebug con_args)]
-pprPmPatDebug (PmNCon x sets)
+pprPmPatDebug (PmNCon x _ sets)
   = hsep [text "PmNCon", ppr x, ppr sets]
 pprPmPatDebug (PmVar vid) = text "PmVar" <+> ppr vid
 pprPmPatDebug (PmLit li)  = text "PmLit" <+> ppr li
@@ -2718,3 +2738,5 @@ pprValAbs ps = hang (text "ValAbs:") 2
 pprValVecDebug :: ValVec -> SDoc
 pprValVecDebug (ValVec vas _d) = text "ValVec" <+>
                                   parens (pprValAbs vas)
+                                  $$ (ppr (delta_tm_cs _d))
+                                  -- $$ (ppr (delta_ty_cs _d))

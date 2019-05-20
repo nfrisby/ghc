@@ -10,7 +10,8 @@ module TmOracle (
 
         -- re-exported from PmExpr
         PmExpr(..), PmLit(..), PmAltCon(..), SimpleEq, ComplexEq, PmVarEnv,
-        PmRefutEnv, eqPmLit, isNotPmExprOther, lhsExprToPmExpr, hsExprToPmExpr,
+        PmRefutEnv, eqPmLit, pmExprToAlt, isNotPmExprOther, lhsExprToPmExpr,
+        hsExprToPmExpr,
 
         -- the term oracle
         tmOracle, TmState, initialTmState, wrapUpTmState, solveOneEq, extendSubst, canDiverge,
@@ -28,6 +29,9 @@ import PmExpr
 
 import Id
 import Name
+import NameEnv
+import UniqFM
+import UniqDFM
 import Type
 import HsLit
 import TcHsSyn
@@ -36,8 +40,6 @@ import ListSetOps (insertNoDup, unionLists)
 import Util
 import Maybes
 import Outputable
-
-import NameEnv
 
 {-
 %************************************************************************
@@ -93,6 +95,15 @@ data TmState = TmS
   -- @y@, we merge the refutable shapes of @x@ into those of @y@.
   }
 
+instance Outputable TmState where
+  ppr state = braces (fsep (punctuate comma (facts ++ pos ++ neg)))
+    where
+      facts = map pos_eq (tm_facts state)
+      pos   = map pos_eq (nonDetUFMToList (tm_pos state))
+      neg   = map neg_eq (udfmToList (tm_neg state))
+      pos_eq (l, r) = ppr l <+> char '~' <+> ppr r
+      neg_eq (l, r) = ppr l <+> char '≁' <+> ppr r
+
 -- | Initial state of the oracle.
 initialTmState :: TmState
 initialTmState = TmS [] emptyNameEnv emptyDNameEnv
@@ -140,7 +151,7 @@ varIn x e = case e of
 -- @x@ and @e@ are completely substituted before!
 isRefutable :: Name -> PmExpr -> PmRefutEnv -> Bool
 isRefutable x e env
-  = fromMaybe False $ elem <$> exprToAlt e <*> lookupDNameEnv env x
+  = fromMaybe False $ elem <$> pmExprToAlt e <*> lookupDNameEnv env x
 
 -- | Solve a complex equality (top-level).
 solveOneEq :: TmState -> ComplexEq -> Maybe TmState
@@ -148,18 +159,11 @@ solveOneEq solver_env@TmS{ tm_pos = pos } complex
   = solveComplexEq solver_env       -- do the actual *merging* with existing state
   $ applySubstComplexEq pos complex -- replace everything we already know
 
-exprToAlt :: PmExpr -> Maybe PmAltCon
--- Note how this deliberately chooses bogus argument types for PmAltConLike.
--- This is only safe for doing lookup in a 'PmRefutEnv'!
-exprToAlt (PmExprCon cl _) = Just (PmAltConLike cl [])
-exprToAlt (PmExprLit l)    = Just (PmAltLit l)
-exprToAlt _                = Nothing
-
 -- | Record that a particular 'Id' can't take the shape of a 'PmAltCon' in the
 -- 'TmState' and return @Nothing@ if that leads to a contradiction.
 addSolveRefutableAltCon :: TmState -> Id -> PmAltCon -> Maybe TmState
 addSolveRefutableAltCon original@TmS{ tm_pos = pos, tm_neg = neg } x nalt
-  = case exprToAlt e of
+  = case pmExprToAlt e of
       Nothing         -> Just extended -- Not solved yet
       Just alt                         -- We have a solution
         | alt == nalt -> Nothing       -- ... which is contradictory
@@ -200,7 +204,9 @@ solveComplexEq solver_state eq@(e1, e2) = case eq of
     False -> Nothing
 
   (PmExprCon c1 ts1, PmExprCon c2 ts2)
-    | c1 == c2  -> foldlM solveComplexEq solver_state (zip ts1 ts2)
+    | pprTrace "PmExprConCon1" (ppr c1 <+> ppr c2) True
+    , c1 == c2
+    , pprTrace "PmExprConCon2" (ppr c1) True -> foldlM solveComplexEq solver_state (zip ts1 ts2)
     | otherwise -> Nothing
 
   (PmExprVar x, PmExprVar y)
