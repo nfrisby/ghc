@@ -5,6 +5,8 @@
 
   * Add a `TestEquality` instance for the `Compose` newtype.
 
+  * Add `HasResolution` instances for `Nat`s.
+
 ## 4.13.0.0 *TBA*
   * Bundled with GHC *TBA*
 
