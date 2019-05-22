@@ -193,7 +193,7 @@ lookupRefutableAltCons x TmS { tm_neg = neg }
 --             it to the tmstate; the result may or may not be
 --             satisfiable
 solveComplexEq :: TmState -> ComplexEq -> Maybe TmState
-solveComplexEq solver_state eq@(e1, e2) = case eq of
+solveComplexEq solver_state eq@(e1, e2) = pprTraceWith "solveComplexEq" (\mb_sat -> ppr eq $$ ppr mb_sat) $ case eq of
   -- We cannot do a thing about these cases
   (PmExprOther _,_)            -> Just solver_state
   (_,PmExprOther _)            -> Just solver_state
@@ -204,9 +204,7 @@ solveComplexEq solver_state eq@(e1, e2) = case eq of
     False -> Nothing
 
   (PmExprCon c1 ts1, PmExprCon c2 ts2)
-    | pprTrace "PmExprConCon1" (ppr c1 <+> ppr c2) True
-    , c1 == c2
-    , pprTrace "PmExprConCon2" (ppr c1) True -> foldlM solveComplexEq solver_state (zip ts1 ts2)
+    | c1 == c2  -> foldlM solveComplexEq solver_state (zip ts1 ts2)
     | otherwise -> Nothing
 
   (PmExprVar x, PmExprVar y)
