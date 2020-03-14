@@ -117,17 +117,6 @@ to float. This means that
       [W] forall[2] . (xxx[1] ~ Empty)
                    => Intersect (BuriedUnder sub k Empty) inv ~ Empty
 
-Note [Running plugins on unflattened wanteds]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There is an annoying mismatch between solveSimpleGivens and
-solveSimpleWanteds, because the latter needs to fiddle with the inert
-set, unflatten and zonk the wanteds.  It passes the zonked wanteds
-to runTcPluginsWanteds, which produces a replacement set of wanteds,
-some additional insolubles and a flag indicating whether to go round
-the loop again.  If so, prepareInertsForImplications is used to remove
-the previous wanteds (which will still be in the inert set).  Note
-that prepareInertsForImplications will discard the insolubles, so we
-must keep track of them separately.
 -}
 
 solveSimpleGivens :: [Ct] -> TcS ()
@@ -170,19 +159,38 @@ solveSimpleWanteds simples
      = return (n,wc)
 
      | otherwise
-     = do { -- Solve
-            (unif_count, wc1) <- solve_simple_wanteds wc
+     = do {
+            -- Solve without unflattening afterwards
+          ; wc1 <- solve_simple_wanteds0 wc
 
             -- Run plugins
           ; (rerun_plugin, wc2) <- runTcPluginsWanted wc1
-             -- See Note [Running plugins on unflattened wanteds]
+
+            -- Solve again to canonicalize the constraints (but run
+            -- the full pipeline while we're at it), and then
+            -- unflatten afterwards. The solve will just be a single
+            -- pass if plugins neither added any constraints nor
+            -- e.g. filled any univars, so we don't count it against
+            -- the limit.
+          ; (unif_count, wc3) <- solve_simple_wanteds wc2
 
           ; if unif_count == 0 && not rerun_plugin
-            then return (n, wc2)             -- Done
+            then return (n, wc3)             -- Done
             else do { traceTcS "solveSimple going round again:" $
                       ppr unif_count $$ ppr rerun_plugin
-                    ; go (n+1) limit wc2 } }      -- Loop
+                    ; go (n+1) limit wc3 } }      -- Loop
 
+
+solve_simple_wanteds0 :: WantedConstraints -> TcS WantedConstraints
+-- Try solving these constraints
+-- Affects the unification state (of course) but not the inert set
+-- The result is not necessarily zonked
+solve_simple_wanteds0 (WC { wc_simple = simples1, wc_impl = implics1 })
+  = nestTcS $
+    do { solveSimples simples1
+       ; (implics2, tv_eqs, fun_eqs, others) <- getUnsolvedInerts
+       ; return $ WC { wc_simple = tv_eqs `andCts` fun_eqs `andCts` others
+                     , wc_impl   = implics1 `unionBags` implics2 } }
 
 solve_simple_wanteds :: WantedConstraints -> TcS (Int, WantedConstraints)
 -- Try solving these constraints
@@ -265,7 +273,6 @@ runTcPluginsWanted wc@(WC { wc_simple = simples1, wc_impl = implics1 })
        ; if null plugins then return (False, wc) else
 
     do { given <- getInertGivens
-       ; simples1 <- zonkSimples simples1    -- Plugin requires zonked inputs
        ; let (wanted, derived) = partition isWantedCt (bagToList simples1)
        ; p <- runTcPlugins plugins (given, derived, wanted)
        ; let (_, _,                solved_wanted)   = pluginSolvedCts p
